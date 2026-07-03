@@ -1,627 +1,283 @@
 """
-Streamlit Web Application for Resume Screening
+Sentiment Analysis — Streamlit Web App
+Classifies customer reviews as Positive, Negative, or Neutral using a
+pretrained TF-IDF + Logistic Regression model.
+
+Run with: streamlit run streamlit_app.py
+(Run from the project root, so it can find src/ and models/)
 """
+
+import os
+import sys
+import re
 
 import streamlit as st
 import pandas as pd
+import joblib
 import matplotlib.pyplot as plt
-import seaborn as sns
-import os
-import sys
-import tempfile
-from io import StringIO
 
-# Add parent directory to path
-sys.path.append(".")
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from src.parser import ResumeParser
-from src.preprocess import TextPreprocessor
-from src.similarity import SimilarityCalculator
-from src.ranking import CandidateRanker
-
-# Page configuration
+# ----------------------------------------------------------------------
+# Page config
+# ----------------------------------------------------------------------
 st.set_page_config(
-    page_title="AI Resume Screening",
-    page_icon="🤖",
+    page_title="Sentiment Analysis",
+    page_icon="💬",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-# Custom CSS
-st.markdown(
-    """
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #667eea;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .score-high {
-        color: #28a745;
-        font-weight: bold;
-    }
-    .score-medium {
-        color: #ffc107;
-        font-weight: bold;
-    }
-    .score-low {
-        color: #dc3545;
-        font-weight: bold;
-    }
-    .stButton button {
-        width: 100%;
-        border-radius: 20px;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border: none;
-        padding: 10px;
-    }
-    .stButton button:hover {
-        transform: scale(1.02);
-        transition: transform 0.2s;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-    }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+MODEL_PATH = os.path.join("models", "best_model.pkl")
+VECTORIZER_PATH = os.path.join("models", "tfidf_vectorizer.pkl")
+
+SENTIMENT_COLORS = {
+    "positive": "#28a745",
+    "negative": "#dc3545",
+    "neutral": "#6c757d",
+}
+SENTIMENT_EMOJI = {
+    "positive": "😊",
+    "negative": "😠",
+    "neutral": "😐",
+}
 
 
-# Initialize components
+# ----------------------------------------------------------------------
+# Text cleaning (kept self-contained so the app works even if src/
+# preprocess.py isn't on the path, e.g. when deployed standalone)
+# ----------------------------------------------------------------------
 @st.cache_resource
-def init_components():
-    """Initialize all components with caching"""
-    parser = ResumeParser()
-    preprocessor = TextPreprocessor()
-    calculator = SimilarityCalculator()
-    ranker = CandidateRanker()
-    return parser, preprocessor, calculator, ranker
+def get_preprocessor():
+    import nltk
+    from nltk.corpus import stopwords
+    from nltk.stem import WordNetLemmatizer
+
+    for pkg in ["punkt", "punkt_tab", "stopwords", "wordnet", "omw-1.4"]:
+        try:
+            nltk.download(pkg, quiet=True)
+        except Exception:
+            pass
+
+    stop_words = set(stopwords.words("english"))
+    lemmatizer = WordNetLemmatizer()
+    return stop_words, lemmatizer
 
 
-# Initialize
-parser, preprocessor, calculator, ranker = init_components()
+def clean_text(text: str, min_token_len: int = 3) -> str:
+    stop_words, lemmatizer = get_preprocessor()
 
-# ====================================================================
-# PROCESSING FUNCTIONS
-# ====================================================================
-
-
-def process_resume_text(text):
-    """Process a single resume text"""
-    if not text:
+    if not isinstance(text, str) or not text:
         return ""
-    return preprocessor.get_full_preprocessed_text(text)
 
+    text = text.lower()
+    text = re.sub(r"http\S+|www\S+", " ", text)
+    text = re.sub(r"@\w+", " ", text)
+    text = re.sub(r"#", "", text)
+    text = re.sub(r"[^a-z\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
 
-def process_jd_text(text):
-    """Process a single job description text"""
-    if not text:
-        return ""
-    return preprocessor.get_full_preprocessed_text(text)
-
-
-def extract_skills(text):
-    """Extract skills from text"""
-    skill_keywords = [
-        "python",
-        "java",
-        "javascript",
-        "react",
-        "angular",
-        "vue",
-        "node",
-        "django",
-        "flask",
-        "spring",
-        "tensorflow",
-        "pytorch",
-        "machine learning",
-        "deep learning",
-        "nlp",
-        "computer vision",
-        "data science",
-        "sql",
-        "mysql",
-        "postgresql",
-        "mongodb",
-        "redis",
-        "aws",
-        "azure",
-        "docker",
-        "kubernetes",
-        "git",
-        "linux",
-        "html",
-        "css",
-        "rest api",
-        "graphql",
-        "c++",
-        "c#",
-        "ruby",
-        "php",
-        "swift",
-        "kotlin",
-        "go",
-        "typescript",
-        "mern",
-        "full stack",
+    tokens = text.split()
+    tokens = [
+        lemmatizer.lemmatize(tok)
+        for tok in tokens
+        if tok not in stop_words and len(tok) >= min_token_len
     ]
-
-    text_lower = text.lower()
-    found_skills = []
-    for skill in skill_keywords:
-        if skill in text_lower:
-            found_skills.append(skill)
-    return found_skills
-
-
-def render_jd_results(results, resume_texts, resume_names, jd_label, key_suffix):
-    """Render metrics, table, charts, top candidate and download button for a single JD's ranking"""
-
-    # Extract skills (independent of which JD this is)
-    skills_list = []
-    for text in resume_texts:
-        skills = extract_skills(text)
-        skills_list.append(", ".join(skills[:5]) if skills else "No skills found")
-
-    results = results.copy()
-    results["Skills"] = skills_list
-
-    # Display metrics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("📊 Total Candidates", len(results))
-    with col2:
-        st.metric("🏆 Top Score", f"{results.iloc[0]['Similarity_Score']:.1f}%")
-    with col3:
-        st.metric("📈 Average Score", f"{results['Similarity_Score'].mean():.1f}%")
-    with col4:
-        st.metric("📁 Resumes", len(resume_texts))
-
-    # Results table
-    st.subheader("📋 Ranked Candidates")
-
-    display_df = results.copy()
-    display_df["Similarity_Score"] = display_df["Similarity_Score"].round(1)
-
-    # Color coding function
-    def color_score(val):
-        if val >= 80:
-            return "background-color: #28a745; color: white"
-        elif val >= 60:
-            return "background-color: #ffc107; color: black"
-        else:
-            return "background-color: #dc3545; color: white"
-
-    # Apply styling
-    styled_df = display_df.style.applymap(color_score, subset=["Similarity_Score"])
-
-    st.dataframe(styled_df, use_container_width=True, height=400)
-
-    # Visualization
-    st.subheader("📈 Score Visualization")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        # Bar chart
-        fig1, ax1 = plt.subplots(figsize=(8, 5))
-        top_n = min(10, len(display_df))
-        colors = [
-            "#2ecc71" if i < 3 else "#f1c40f" if i < 6 else "#e74c3c"
-            for i in range(top_n)
-        ]
-
-        ax1.barh(
-            display_df["Candidate"][:top_n][::-1],
-            display_df["Similarity_Score"][:top_n][::-1],
-            color=colors[::-1],
-        )
-        ax1.set_xlabel("Similarity Score (%)")
-        ax1.set_title("Top Candidates")
-        ax1.set_xlim(0, 100)
-        plt.tight_layout()
-        st.pyplot(fig1)
-        plt.close(fig1)
-
-    with col2:
-        # Histogram
-        fig2, ax2 = plt.subplots(figsize=(8, 5))
-        ax2.hist(
-            display_df["Similarity_Score"],
-            bins=10,
-            color="skyblue",
-            edgecolor="black",
-            alpha=0.7,
-        )
-        ax2.axvline(
-            display_df["Similarity_Score"].mean(),
-            color="red",
-            linestyle="dashed",
-            linewidth=2,
-            label=f'Mean: {display_df["Similarity_Score"].mean():.1f}%',
-        )
-        ax2.axvline(
-            display_df["Similarity_Score"].median(),
-            color="green",
-            linestyle="dashed",
-            linewidth=2,
-            label=f'Median: {display_df["Similarity_Score"].median():.1f}%',
-        )
-        ax2.set_xlabel("Similarity Score (%)")
-        ax2.set_ylabel("Frequency")
-        ax2.set_title("Score Distribution")
-        ax2.legend()
-        plt.tight_layout()
-        st.pyplot(fig2)
-        plt.close(fig2)
-
-    # Top candidate details
-    st.subheader("🏆 Top Candidate")
-    top = results.iloc[0]
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.info(f"**Candidate:** {top['Candidate']}")
-    with col2:
-        st.success(f"**Score:** {top['Similarity_Score']:.1f}%")
-    with col3:
-        st.info(f"**Skills:** {top.get('Skills', 'N/A')}")
-
-    # Download button
-    csv = display_df.to_csv(index=False)
-    safe_label = "".join(c if c.isalnum() else "_" for c in jd_label)[:40]
-    st.download_button(
-        label=f"📥 Download Results CSV ({jd_label})",
-        data=csv,
-        file_name=f"ranked_candidates_{safe_label}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key=f"download_{key_suffix}",
-    )
-
-    return results
-
-
-def display_results(resume_texts, jd_texts, resume_names, jd_names=None):
-    """Display ranking results. Supports multiple job descriptions via tabs —
-    each JD gets its own ranking, computed from the same similarity matrix."""
-    if not resume_texts or not jd_texts:
-        st.warning("⚠️ Please provide both resumes and job descriptions")
-        return
-
-    if jd_names is None:
-        jd_names = [f"Job Description {i+1}" for i in range(len(jd_texts))]
-
-    try:
-        with st.spinner("🔄 Processing and ranking candidates..."):
-            # Preprocess texts (done once, regardless of how many JDs)
-            cleaned_resumes = [process_resume_text(t) for t in resume_texts]
-            cleaned_jds = [process_jd_text(t) for t in jd_texts]
-
-            # Calculate similarity matrix: shape (n_resumes, n_jds)
-            similarity_matrix = calculator.calculate_similarity_scores(
-                cleaned_resumes, cleaned_jds
-            )
-
-            st.success("✅ Processing complete!")
-
-            if len(jd_texts) == 1:
-                # Single JD — render directly, no tabs needed
-                results = ranker.rank_candidates(
-                    similarity_matrix, resume_names, resume_names, jd_index=0
-                )
-                render_jd_results(results, resume_texts, resume_names, jd_names[0], key_suffix="0")
-            else:
-                # Multiple JDs — one tab per job description, each with its own ranking
-                st.info(
-                    f"📋 {len(jd_texts)} job descriptions provided — showing ranked "
-                    f"candidates separately for each. Select a tab below."
-                )
-                tabs = st.tabs([f"🎯 {name}" for name in jd_names])
-                for jd_index, tab in enumerate(tabs):
-                    with tab:
-                        results = ranker.rank_candidates(
-                            similarity_matrix,
-                            resume_names,
-                            resume_names,
-                            jd_index=jd_index,
-                        )
-                        render_jd_results(
-                            results,
-                            resume_texts,
-                            resume_names,
-                            jd_names[jd_index],
-                            key_suffix=str(jd_index),
-                        )
-
-            return similarity_matrix
-
-    except Exception as e:
-        st.error(f"❌ Error processing: {str(e)}")
-        return None
-
-
-def process_files(resume_files, jd_files):
-    """Process uploaded files"""
-    if not resume_files or not jd_files:
-        st.warning("⚠️ Please upload both resumes and job descriptions")
-        return
-
-    resume_texts = []
-    resume_names = []
-
-    # Create progress bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    try:
-        # Process resumes
-        for i, file in enumerate(resume_files):
-            status_text.text(
-                f"📄 Processing resume {i+1}/{len(resume_files)}: {file.name}"
-            )
-
-            # Save temporarily
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(file.getvalue())
-                tmp_path = tmp_file.name
-
-            try:
-                text = parser.extract_text(tmp_path)
-                if text:
-                    resume_texts.append(text)
-                    resume_names.append(
-                        file.name.replace(".pdf", "").replace("_", " ").title()
-                    )
-                else:
-                    resume_texts.append("")  # Empty text
-                    resume_names.append(file.name.replace(".pdf", ""))
-            finally:
-                # Clean up temp file
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-
-            progress_bar.progress((i + 1) / (len(resume_files) + len(jd_files)))
-
-        # Process job descriptions
-        jd_texts = []
-        jd_names = []
-        for i, file in enumerate(jd_files):
-            status_text.text(f"📄 Processing JD {i+1}/{len(jd_files)}: {file.name}")
-
-            try:
-                text = file.getvalue().decode("utf-8")
-                jd_texts.append(text)
-                jd_names.append(file.name.replace(".txt", "").replace("_", " ").title())
-            except Exception as e:
-                st.warning(f"Could not read {file.name}: {str(e)}")
-                jd_texts.append("")
-                jd_names.append(file.name)
-
-            progress_bar.progress(
-                (len(resume_files) + i + 1) / (len(resume_files) + len(jd_files))
-            )
-
-        status_text.text("✅ Processing complete!")
-        progress_bar.progress(1.0)
-
-        # Display results (one tab per JD if more than one was uploaded)
-        display_results(resume_texts, jd_texts, resume_names, jd_names)
-
-    except Exception as e:
-        st.error(f"❌ Error processing files: {str(e)}")
-
-
-def process_text(resume_text, jd_text):
-    """Process text input"""
-    if not resume_text or not jd_text:
-        st.warning("⚠️ Please enter both resume and job description text")
-        return
-
-    display_results([resume_text], [jd_text], ["Candidate"])
-
-
-def process_sample_data(resumes, jds):
-    """Process sample data"""
-    if not resumes or not jds:
-        st.warning("⚠️ No sample data available")
-        return
-
-    resume_names = [f"Sample {i+1}" for i in range(len(resumes))]
-    jd_names = [jd.strip().split("\n")[0] for jd in jds]
-    display_results(resumes, jds, resume_names, jd_names)
-
-
-def load_sample_data():
-    """Load sample data"""
-    sample_resumes = [
-        """John Smith
-Python Developer | 5 years experience
-Skills: Python, Machine Learning, Deep Learning, NLP, SQL, TensorFlow, PyTorch
-Experience: Senior Data Scientist at Google (2020-2024)""",
-        """Sarah Johnson
-Full Stack Developer | 4 years experience
-Skills: React, Node.js, MongoDB, Express, JavaScript, TypeScript, AWS
-Experience: Full Stack Developer at Microsoft (2021-2024)""",
-        """Mike Chen
-Data Scientist | 3 years experience
-Skills: Python, Machine Learning, Data Analysis, SQL, Scikit-learn, Pandas
-Experience: Data Scientist at Amazon (2021-2024)""",
-        """Emily Davis
-Frontend Developer | 3 years experience
-Skills: React, Angular, Vue.js, JavaScript, HTML5, CSS3, TypeScript
-Experience: Frontend Developer at Meta (2020-2023)""",
-        """David Wilson
-Backend Developer | 5 years experience
-Skills: Python, Django, Flask, PostgreSQL, Docker, AWS, Redis
-Experience: Senior Backend Developer at Netflix (2019-2024)""",
-    ]
-
-    sample_jds = [
-        """Senior Data Scientist
-Skills Required: Python, Machine Learning, Deep Learning, NLP, SQL
-Experience: 3+ years in data science""",
-        """Full Stack Developer
-Skills Required: React, Node.js, MongoDB, Express, AWS
-Experience: 3+ years in full stack development""",
-        """AI Engineer
-Skills Required: Python, Machine Learning, Deep Learning, NLP, TensorFlow
-Experience: 2+ years in AI/ML""",
-    ]
-
-    return sample_resumes, sample_jds
-
-
-# ====================================================================
-# UI COMPONENTS
-# ====================================================================
-
-# Sidebar
-st.sidebar.title("🤖 Resume Screening")
-st.sidebar.markdown("---")
-
-upload_option = st.sidebar.radio(
-    "Select Input Method", ["📤 Upload Files", "📝 Enter Text", "📊 Use Sample Data"]
-)
-
-st.sidebar.markdown("---")
-st.sidebar.info(
-    "💡 **Tip:** Upload PDF resumes and TXT job descriptions "
-    "to get AI-powered candidate rankings."
-)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Version 1.0 | Made with ❤️")
-
-# ====================================================================
-# MAIN CONTENT
-# ====================================================================
-
-# Header
-st.markdown(
-    '<h1 class="main-header">📄 AI Resume Screening & Ranking</h1>',
-    unsafe_allow_html=True,
-)
-
-if upload_option == "📤 Upload Files":
-    st.header("📤 Upload Resumes and Job Descriptions")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("📄 Resumes")
-        resume_files = st.file_uploader(
-            "Upload Resumes (PDF)",
-            type=["pdf"],
-            accept_multiple_files=True,
-            key="resume_uploader",
-        )
-
-        if resume_files:
-            st.success(f"✅ {len(resume_files)} resume(s) uploaded")
-            for f in resume_files:
-                st.caption(f"📎 {f.name} ({f.size/1024:.1f} KB)")
-
-    with col2:
-        st.subheader("📋 Job Descriptions")
-        jd_files = st.file_uploader(
-            "Upload Job Descriptions (TXT)",
-            type=["txt"],
-            accept_multiple_files=True,
-            key="jd_uploader",
-        )
-
-        if jd_files:
-            st.success(f"✅ {len(jd_files)} job description(s) uploaded")
-            for f in jd_files:
-                st.caption(f"📎 {f.name} ({f.size/1024:.1f} KB)")
-
-    if st.button("🚀 Start Screening", type="primary", use_container_width=True):
-        if resume_files and jd_files:
-            process_files(resume_files, jd_files)
-        else:
-            st.warning("⚠️ Please upload both resumes and job descriptions")
-
-elif upload_option == "📝 Enter Text":
-    st.header("📝 Enter Resume and Job Description Text")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("📄 Resume Text")
-        resume_text = st.text_area(
-            "Paste resume text here...",
-            height=300,
-            placeholder="Enter resume text...",
-            key="resume_text_input",
-        )
-
-        # Example resume text
-        if st.button("📋 Load Example Resume"):
-            st.session_state.resume_text_input = """John Doe
-Python Developer | 5 years experience
-Skills: Python, Machine Learning, Deep Learning, SQL, TensorFlow
-Experience: Data Scientist at Google (2020-2024)"""
-            st.rerun()
-
-    with col2:
-        st.subheader("📋 Job Description Text")
-        jd_text = st.text_area(
-            "Paste job description here...",
-            height=300,
-            placeholder="Enter job description text...",
-            key="jd_text_input",
-        )
-
-        # Example JD text
-        if st.button("📋 Load Example JD"):
-            st.session_state.jd_text_input = """Senior Data Scientist
-Skills: Python, Machine Learning, Deep Learning, NLP, SQL
-Experience: 3+ years"""
-            st.rerun()
-
-    if st.button("🔍 Analyze", type="primary", use_container_width=True):
-        if resume_text and jd_text:
-            process_text(resume_text, jd_text)
-        else:
-            st.warning("⚠️ Please enter both resume and job description text")
-
-else:  # "📊 Use Sample Data"
-    st.header("📊 Sample Data Analysis")
-
-    st.info(
-        "📌 This will use pre-loaded sample resumes and job descriptions "
-        "to demonstrate the system's capabilities."
-    )
-
-    # Show sample data
-    with st.expander("📄 View Sample Resumes"):
-        sample_resumes, _ = load_sample_data()
-        for i, resume in enumerate(sample_resumes, 1):
-            st.text_area(f"Resume {i}", resume, height=100, disabled=True)
-
-    with st.expander("📋 View Sample Job Descriptions"):
-        _, sample_jds = load_sample_data()
-        for i, jd in enumerate(sample_jds, 1):
-            st.text_area(f"Job Description {i}", jd, height=80, disabled=True)
-
-    if st.button(
-        "📥 Load & Process Sample Data", type="primary", use_container_width=True
-    ):
-        with st.spinner("Loading sample data..."):
-            sample_resumes, sample_jds = load_sample_data()
-            process_sample_data(sample_resumes, sample_jds)
-
-# Footer
-st.markdown("---")
+    return " ".join(tokens)
+
+
+# ----------------------------------------------------------------------
+# Model loading
+# ----------------------------------------------------------------------
+@st.cache_resource
+def load_model():
+    if not os.path.exists(MODEL_PATH) or not os.path.exists(VECTORIZER_PATH):
+        return None, None
+    model = joblib.load(MODEL_PATH)
+    vectorizer = joblib.load(VECTORIZER_PATH)
+    return model, vectorizer
+
+
+def predict_sentiment(text, model, vectorizer):
+    """Return (label, confidence_dict_or_None)"""
+    cleaned = clean_text(text)
+    features = vectorizer.transform([cleaned])
+    label = model.predict(features)[0]
+
+    confidence = None
+    if hasattr(model, "predict_proba"):
+        probs = model.predict_proba(features)[0]
+        confidence = dict(zip(model.classes_, probs))
+
+    return label, confidence
+
+
+# ----------------------------------------------------------------------
+# UI
+# ----------------------------------------------------------------------
+st.title("💬 Sentiment Analysis on Customer Reviews")
 st.caption(
-    "🔬 AI Resume Screening System | Built with Streamlit, Scikit-learn, and NLP"
+    "Classifies reviews as Positive, Negative, or Neutral — powered by TF-IDF + Logistic Regression"
 )
+
+model, vectorizer = load_model()
+
+if model is None:
+    st.error(
+        "⚠️ Trained model not found. Please run `notebooks/sentiment_analysis.ipynb` "
+        "first — it saves `models/best_model.pkl` and `models/tfidf_vectorizer.pkl`."
+    )
+    st.stop()
+
+with st.sidebar:
+    st.header("ℹ️ About")
+    st.write(
+        "This app uses a machine learning model trained on the "
+        "**Twitter US Airline Sentiment** dataset (14,640 labeled tweets) "
+        "to classify review text as Positive, Negative, or Neutral."
+    )
+    st.write(f"**Model:** `{type(model).__name__}`")
+    st.write(f"**Vocabulary size:** {len(vectorizer.get_feature_names_out()):,}")
+    st.markdown("---")
+    st.header("🎯 Mode")
+    mode = st.radio("Choose input mode", ["Single Review", "Batch (CSV Upload)"])
+
+# ------------------------------------------------------------------
+# Mode 1: Single review
+# ------------------------------------------------------------------
+if mode == "Single Review":
+    st.subheader("📝 Enter a Review")
+
+    example_reviews = {
+        "-- Select an example --": "",
+        "Positive example": "Amazing service, the crew was so friendly and helpful throughout the flight!",
+        "Negative example": "The flight was delayed for 5 hours and the staff was extremely rude.",
+        "Neutral example": "The flight departed and arrived on time, nothing special to mention.",
+    }
+    selected_example = st.selectbox(
+        "Try an example, or write your own below:", list(example_reviews.keys())
+    )
+
+    default_text = example_reviews[selected_example]
+    review_text = st.text_area(
+        "Review text",
+        value=default_text,
+        height=120,
+        placeholder="Type or paste a customer review here...",
+    )
+
+    if st.button("🔍 Analyze Sentiment", use_container_width=True, type="primary"):
+        if not review_text.strip():
+            st.warning("⚠️ Please enter some review text.")
+        else:
+            with st.spinner("Analyzing..."):
+                label, confidence = predict_sentiment(review_text, model, vectorizer)
+
+            color = SENTIMENT_COLORS.get(label, "#333333")
+            emoji = SENTIMENT_EMOJI.get(label, "")
+
+            st.markdown(
+                f"""
+                <div style="padding: 20px; border-radius: 10px; background-color: {color}22;
+                            border: 2px solid {color}; text-align: center;">
+                    <h2 style="color: {color}; margin: 0;">{emoji} {label.upper()}</h2>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if confidence:
+                st.subheader("📊 Confidence Breakdown")
+                conf_df = pd.DataFrame(
+                    {
+                        "Sentiment": list(confidence.keys()),
+                        "Confidence": list(confidence.values()),
+                    }
+                ).sort_values("Confidence", ascending=False)
+                conf_df["Confidence"] = (conf_df["Confidence"] * 100).round(1)
+
+                fig, ax = plt.subplots(figsize=(6, 3))
+                colors = [SENTIMENT_COLORS.get(s, "#333") for s in conf_df["Sentiment"]]
+                ax.barh(conf_df["Sentiment"], conf_df["Confidence"], color=colors)
+                ax.set_xlabel("Confidence (%)")
+                ax.set_xlim(0, 100)
+                for i, v in enumerate(conf_df["Confidence"]):
+                    ax.text(v + 1, i, f"{v}%", va="center")
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+            else:
+                st.info(
+                    "ℹ️ This model type doesn't provide confidence scores "
+                    "(e.g. Linear SVM) — only the predicted label is shown."
+                )
+
+# ------------------------------------------------------------------
+# Mode 2: Batch CSV upload
+# ------------------------------------------------------------------
+else:
+    st.subheader("📂 Upload a CSV of Reviews")
+    st.write("The CSV must contain a column with review text.")
+
+    uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"])
+
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"❌ Could not read CSV: {e}")
+            st.stop()
+
+        st.write("Preview:")
+        st.dataframe(df.head(), use_container_width=True)
+
+        text_column = st.selectbox(
+            "Select the column containing review text:", df.columns
+        )
+
+        if st.button(
+            "🔍 Analyze All Reviews", use_container_width=True, type="primary"
+        ):
+            with st.spinner(f"Analyzing {len(df)} reviews..."):
+                texts = df[text_column].fillna("").astype(str).tolist()
+                cleaned_texts = [clean_text(t) for t in texts]
+                features = vectorizer.transform(cleaned_texts)
+                predictions = model.predict(features)
+                df["predicted_sentiment"] = predictions
+
+            st.success(f"✅ Analyzed {len(df)} reviews!")
+
+            col1, col2, col3 = st.columns(3)
+            counts = df["predicted_sentiment"].value_counts()
+            with col1:
+                st.metric("😊 Positive", counts.get("positive", 0))
+            with col2:
+                st.metric("😠 Negative", counts.get("negative", 0))
+            with col3:
+                st.metric("😐 Neutral", counts.get("neutral", 0))
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            order = [
+                s for s in ["negative", "neutral", "positive"] if s in counts.index
+            ]
+            colors = [SENTIMENT_COLORS[s] for s in order]
+            ax.bar(order, [counts[s] for s in order], color=colors)
+            ax.set_ylabel("Count")
+            ax.set_title("Sentiment Distribution")
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            st.subheader("📋 Results")
+            st.dataframe(df, use_container_width=True, height=400)
+
+            csv = df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Results CSV",
+                data=csv,
+                file_name="sentiment_predictions.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+st.markdown("---")
+st.caption("Built with Streamlit · scikit-learn · NLTK")
